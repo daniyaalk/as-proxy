@@ -1,12 +1,14 @@
 mod handler;
 mod utils;
 
-use crate::handler::{TransformDecision, transform_client_to_server, transform_server_to_client};
+use crate::handler::{
+    ReplayRecord, TransformDecision, transform_client_to_server, transform_server_to_client,
+};
 use crate::utils::parser::{
     AerospikeKey, AerospikeOperation, AerospikePacket, AerospikePacketBody, INFO1_ALLOWED_MASK,
     INFO2_ALLOWED_MASK, INFO3_ALLOWED_MASK, INFO4_ALLOWED_MASK, ParseError,
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use kafka::producer::{Producer, RequiredAcks};
 use serde::Deserialize;
@@ -59,6 +61,36 @@ struct AppState {
     diff_map: Arc<RwLock<TtlCache<AerospikeKey, Vec<AerospikeOperation>>>>,
     #[cfg(feature = "replay")]
     kafka_producer: Option<Arc<Mutex<Producer>>>,
+}
+
+impl AppState {
+    pub fn is_write_intercept_enabled(&self) -> bool {
+        self.config.intercept_writes.unwrap_or(false)
+    }
+
+    #[cfg(feature = "replay")]
+    pub fn is_kafka_consumer_enabled(&self) -> bool {
+        self.config
+            .kafka_config
+            .as_ref()
+            .is_some_and(|kc| kc.mode == KafkaMode::Consume)
+    }
+
+    pub fn intercept_messages(&self) -> bool {
+
+        #[cfg(feature = "replay")]
+        {
+            self.is_write_intercept_enabled() || self.is_kafka_consumer_enabled()
+        }
+
+        #[cfg(not(feature = "replay"))]
+        {
+            self.is_write_intercept_enabled()
+        }
+
+
+    }
+
 }
 
 fn load_config(path: &PathBuf) -> Result<Config> {
@@ -209,6 +241,20 @@ async fn main() -> Result<()> {
     let diff_map: Arc<RwLock<TtlCache<AerospikeKey, Vec<AerospikeOperation>>>> =
         Arc::new(RwLock::new(TtlCache::new(20)));
 
+    #[cfg(feature = "replay")]
+    if config
+        .kafka_config
+        .as_ref()
+        .is_some_and(|kc| kc.mode == KafkaMode::Consume)
+    {
+        match spawn_kafka_receiver(diff_map.clone(), &config.kafka_config, config.diff_ttl) {
+            Ok(_) => {}
+            Err(err) => {
+                panic!("Unable to start kafka! err: {}", err)
+            }
+        }
+    }
+
     let state = Arc::new(AppState {
         config: config.clone(),
         diff_map,
@@ -233,6 +279,52 @@ async fn main() -> Result<()> {
         .await
         .context("failed to install Ctrl+C handler")?;
     info!("shutting down");
+    Ok(())
+}
+
+fn spawn_kafka_receiver(
+    cache: Arc<RwLock<TtlCache<AerospikeKey, Vec<AerospikeOperation>>>>,
+    kafka_config: &Option<KafkaConfig>,
+    diff_ttl: u64,
+) -> Result<()> {
+    let kafka_config = match kafka_config {
+        Some(kafka_config) => kafka_config,
+        None => return Err(anyhow!("kafka config not found")),
+    };
+
+    let mut consumer = kafka::consumer::Consumer::from_hosts(
+        kafka_config.hosts.split(",").map(String::from).collect(),
+    )
+    .with_topic(kafka_config.topic.clone())
+    .with_fetch_max_bytes_per_partition(16 * 1024 * 1024)
+    .create()?;
+
+    let _ = tokio::spawn(async move {
+        loop {
+            match consumer.poll() {
+                Ok(poll) => {
+                    for ms in poll.iter() {
+                        for message in ms.messages() {
+                            let message_string = String::from_utf8(message.value.to_vec()).unwrap();
+
+                            match serde_json::from_str::<ReplayRecord>(&message_string) {
+                                Ok(record) => {
+                                    let mut cache = cache.write().unwrap();
+                                    cache.insert(
+                                        record.key,
+                                        record.operations,
+                                        Duration::from_secs(diff_ttl),
+                                    );
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                    }
+                }
+                Err(_) => {}
+            };
+        }
+    });
     Ok(())
 }
 

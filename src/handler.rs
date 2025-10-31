@@ -39,8 +39,10 @@ pub async fn transform_client_to_server(
     };
 
     if let AerospikePacketBody::Message(message) = packet.body {
-        if state.config.intercept_writes.is_some_and(|x| x == true) {
-            if message.is_write_op() {
+        if state.intercept_messages() ||
+            (cfg!(feature = "replay") && state.is_kafka_consumer_enabled()) {
+
+                if message.is_write_op() {
                 let key = AerospikeKey::parse(&message.fields);
 
                 if key.is_some() {
@@ -146,7 +148,7 @@ pub async fn transform_server_to_client(
 }
 #[cfg(feature = "replay")]
 #[derive(Serialize, Deserialize, Debug)]
-struct ReplayRecord {
-    key: AerospikeKey,
-    operations: Vec<AerospikeOperation>,
+pub struct ReplayRecord {
+    pub key: AerospikeKey,
+    pub operations: Vec<AerospikeOperation>,
 }

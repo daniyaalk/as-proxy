@@ -9,6 +9,6 @@ diff_ttl=120
 [kafka_config]
 hosts = "localhost:9092"
 topic = "test"
-mode = "Produce"
+mode = "Consume"
 
 
