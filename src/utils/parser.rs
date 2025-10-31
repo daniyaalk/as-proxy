@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::io;
 use std::io::{Cursor, Read};
 use std::string::FromUtf8Error;
+use toml::macros::push_toml;
 use tracing::warn;
 
 
@@ -23,7 +24,7 @@ pub struct AerospikePacket {
 }
 
 impl AerospikePacket {
-    pub fn parse(data: &[u8]) -> Result<AerospikePacket, ParseError> {
+    pub fn from_bytes(data: &[u8]) -> Result<AerospikePacket, ParseError> {
         if data.len() < 8 {
             return Err(ParseError::PacketTooShort);
         }
@@ -40,8 +41,37 @@ impl AerospikePacket {
             version,
             message_type,
             size,
-            body: AerospikePacketBody::parse(message_type, size as usize, &data[8..])?,
+            body: AerospikePacketBody::from_bytes(message_type, size as usize, &data[8..])?,
         })
+    }
+
+    pub fn new(body: AerospikePacketBody) -> AerospikePacket {
+
+        let message_type;
+        let size;
+        match &body {
+            AerospikePacketBody::Message(m) => {
+                message_type = 0x03;
+                size = m.get_raw_byte_size();
+            },
+            _ => unimplemented!()
+        };
+        AerospikePacket {
+            version: 0x02,
+            size: size as u64, // Add size of type
+            message_type,
+            body,
+        }
+    }
+
+    pub fn to_bytes(self) -> Vec<u8> {
+        let mut ret: Vec<u8> = Vec::with_capacity(self.size as usize + 10);
+
+        ret.push(self.version);
+        ret.push(self.message_type);
+        ret.extend(&(self.size).to_be_bytes()[2..]);
+            ret.extend(self.body.to_bytes());
+        ret
     }
 }
 
@@ -54,8 +84,8 @@ pub struct AerospikeMessage {
     pub info4: u8,
     result_code: u8,
     generation: u32,
-    record_ttl: u32,
-    transaction_ttl: u32,
+    pub record_ttl: u32,
+    pub transaction_ttl: u32,
     n_fields: u16,
     n_ops: u16,
     pub fields: Vec<AerospikeField>,
@@ -63,7 +93,7 @@ pub struct AerospikeMessage {
 }
 
 impl AerospikeMessage {
-    pub fn parse(data: &[u8]) -> Result<AerospikeMessage, ParseError> {
+    pub fn from_bytes(data: &[u8]) -> Result<AerospikeMessage, ParseError> {
         if data.len() == 0 {
             return Err(ParseError::HeaderSizeNotPresent);
         }
@@ -109,7 +139,104 @@ impl AerospikeMessage {
         })
     }
 
-    pub fn is_read(&self) -> bool {
+    pub fn get_raw_byte_size(&self) -> usize {
+        let mut size = 22;
+
+        for field in &self.fields {
+            size += field.get_raw_byte_size();
+        }
+
+        for operation in &self.operations {
+            size += operation.get_raw_byte_size();
+        }
+
+        size
+    }
+    pub fn to_bytes(self) -> Vec<u8> {
+        let mut ret: Vec<u8> = Vec::with_capacity(self.header_sz as usize);
+        ret.push(self.header_sz);
+        ret.push(self.info1);
+        ret.push(self.info2);
+        ret.push(self.info3);
+        ret.push(self.info4);
+        ret.push(self.result_code);
+        ret.extend(self.generation.to_be_bytes());
+        ret.extend(self.record_ttl.to_be_bytes());
+        ret.extend(self.transaction_ttl.to_be_bytes());
+        ret.extend(self.n_fields.to_be_bytes());
+        ret.extend(self.n_ops.to_be_bytes());
+
+        for field in self.fields {
+            ret.extend(field.to_bytes());
+        }
+
+        for operation in self.operations {
+            ret.extend(operation.to_bytes());
+        }
+
+
+        ret
+    }
+
+    pub fn new(info1: u8, info2: u8, info3: u8, info4: u8, result_code: u8, generation: u32, record_ttl: u32, transaction_ttl: u32, fields: Vec<AerospikeField>, operations: Vec<AerospikeOperation>) -> Self {
+        AerospikeMessage {
+            header_sz: 0x16,
+            info1,
+            info2,
+            info3,
+            info4,
+            result_code,
+            generation,
+            record_ttl,
+            transaction_ttl,
+            n_fields: fields.len() as u16,
+            n_ops: operations.len() as u16,
+            fields,
+            operations,
+        }
+    }
+    pub fn get_successful_write_packet(record_ttl: u32, transaction_ttl: u32) -> Vec<u8> {
+
+        let mut ret = Vec::with_capacity(22);
+        ret.push(0x02); // version
+
+        ret.push(0x03); // message_type
+
+        // size
+        ret.push(0x00);
+        ret.push(0x00);
+        ret.push(0x00);
+        ret.push(0x00);
+        ret.push(0x00);
+        ret.push(0x16);
+
+        ret.push(0x16); // header_sz
+        ret.push(0); // info1
+        ret.push(0); // info2
+        ret.push(0); // info3
+        ret.push(0); // info 4
+        ret.push(0); // result_code
+
+        for i in 0..4 {
+            ret.push(0x00); // generation
+        }
+
+        record_ttl.to_be_bytes().iter().for_each(|&x| ret.push(x));
+        transaction_ttl.to_be_bytes().iter().for_each(|&x| ret.push(x));
+
+
+        // n_fields
+        ret.push(0x00);
+        ret.push(0x00);
+
+        // n_ops
+        ret.push(0x00);
+        ret.push(0x00);
+
+        ret
+    }
+
+    pub fn is_read_op(&self) -> bool {
         self.info1 & (1<<0) != 0
     }
 
@@ -122,7 +249,7 @@ impl AerospikeMessage {
 
     }
 
-    pub fn is_write(&self) -> bool {
+    pub fn is_write_op(&self) -> bool {
         self.info2 & (1<<0) != 0
     }
 
@@ -158,11 +285,21 @@ pub enum AerospikePacketBody {
 }
 
 impl AerospikePacketBody {
-    pub fn parse(msg_type: u8, len: usize, data: &[u8]) -> Result<AerospikePacketBody, ParseError> {
+    pub fn from_bytes(msg_type: u8, len: usize, data: &[u8]) -> Result<AerospikePacketBody, ParseError> {
         match msg_type {
             0x01 => Self::parse_info_packet(data),
-            0x03 => Ok(AerospikePacketBody::Message(AerospikeMessage::parse(data)?)),
+            0x03 => Ok(AerospikePacketBody::Message(AerospikeMessage::from_bytes(data)?)),
             _ => Err(ParseError::UnsupportedMessageType),
+        }
+    }
+
+    pub fn to_bytes(self) -> Vec<u8> {
+
+        match self {
+            AerospikePacketBody::Message(m) => {
+                m.to_bytes()
+            },
+            AerospikePacketBody::Info(_) => todo!(),
         }
     }
 
@@ -197,6 +334,7 @@ impl AerospikePacketBody {
 pub type AerospikeInfo = HashMap<String, Option<String>>;
 
 #[derive(Debug)]
+#[derive(PartialEq)]
 pub enum AerospikeFieldType {
     Namespace=0,
     Set=1,
@@ -267,8 +405,14 @@ impl TryFrom<u8> for AerospikeFieldType {
 #[derive(Debug)]
 pub struct AerospikeField {
     size: u32,
-    field_type: AerospikeFieldType,
+    pub field_type: AerospikeFieldType,
     pub data: Vec<u8>,
+}
+
+impl AerospikeField {
+    pub(crate) fn get_raw_byte_size(&self) -> usize {
+        todo!()
+    }
 }
 
 impl AerospikeField {
@@ -303,11 +447,15 @@ impl AerospikeField {
             data,
         })
     }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        todo!()
+    }
 }
 
-#[derive(Debug)]
+#[derive(Debug,Clone)]
 pub struct AerospikeOperation {
-    pub op_sz: u32,
+    op_sz: u32,
     pub op: u8,
     pub particle_type: u8,
     pub bin_version: u8,
@@ -315,6 +463,7 @@ pub struct AerospikeOperation {
     pub bin_name: String,
     pub data: Vec<u8>,
 }
+
 
 impl AerospikeOperation {
     fn parse(count: usize, cursor: &mut Cursor<&[u8]>) -> Result<Vec<AerospikeOperation>, ParseError> {
@@ -325,6 +474,34 @@ impl AerospikeOperation {
         }
 
         Ok(fields)
+    }
+
+    fn to_bytes(mut self) -> Vec<u8> {
+        let mut ret: Vec<u8> = Vec::with_capacity(4 + self.op_sz as usize);
+        ret.extend(self.op_sz.to_be_bytes());
+        ret.push(self.op);
+        ret.push(self.particle_type);
+        ret.push(self.bin_version);
+        ret.push(self.bin_name_length);
+        ret.append(&mut self.bin_name.as_bytes().to_vec());
+        ret.append(&mut self.data);
+        ret
+    }
+
+    pub fn new(op: u8, particle_type: u8, bin_version: u8, bin_name: &str, data: Vec<u8>) -> Self {
+        let op_sz: u32 = (4 + bin_name.len() + data.len()) as u32;
+        AerospikeOperation {
+            op_sz,
+            op,
+            particle_type,
+            bin_version,
+            bin_name_length: bin_name.len() as u8,
+            bin_name: bin_name.into(),
+            data
+        }
+    }
+    fn get_raw_byte_size(&self) -> usize {
+        4 + self.op_sz as usize
     }
 
     fn parse_one(cursor: &mut Cursor<&[u8]>) -> Result<AerospikeOperation, ParseError> {
@@ -353,6 +530,30 @@ impl AerospikeOperation {
             bin_name_length,
             bin_name,
             data,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AerospikeKey {
+    pub namespace: String,
+    pub set: String,
+    pub digest: Vec<u8>
+}
+
+
+impl AerospikeKey {
+    pub fn parse(fields: Vec<AerospikeField>) -> Option<Self> {
+        if fields.len() != 3 { return None;}
+
+        let namespace = fields.iter().filter(|x| x.field_type == AerospikeFieldType::Namespace).last()?;
+        let set = fields.iter().filter(|x| x.field_type == AerospikeFieldType::Set).last()?;
+        let digest = fields.iter().filter(|x| x.field_type == AerospikeFieldType::Namespace).last()?;
+
+        Some(AerospikeKey {
+            namespace: String::from_utf8(namespace.data.clone()).ok()?,
+            set: String::from_utf8(set.data.clone()).ok()?,
+            digest: digest.data.to_vec()
         })
     }
 }

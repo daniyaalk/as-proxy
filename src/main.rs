@@ -1,8 +1,9 @@
 mod utils;
+mod handler;
 
 use std::{collections::HashMap, fs, path::PathBuf, sync::Arc};
-
-use crate::utils::parser::{AerospikePacket, AerospikePacketBody, ParseError, INFO1_ALLOWED_MASK, INFO2_ALLOWED_MASK, INFO3_ALLOWED_MASK, INFO4_ALLOWED_MASK};
+use std::sync::{Mutex, RwLock};
+use crate::utils::parser::{AerospikeKey, AerospikeOperation, AerospikePacket, AerospikePacketBody, ParseError, INFO1_ALLOWED_MASK, INFO2_ALLOWED_MASK, INFO3_ALLOWED_MASK, INFO4_ALLOWED_MASK};
 use anyhow::{Context, Result};
 use clap::Parser;
 use serde::Deserialize;
@@ -12,6 +13,8 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 use tracing::{debug, error, info, warn};
+use ttl_cache::TtlCache;
+use crate::handler::{transform_client_to_server, transform_server_to_client, TransformDecision};
 
 #[derive(Parser, Debug)]
 #[command(name = "as-proxy", version, about = "Simple multi-port TCP proxy")]
@@ -20,19 +23,17 @@ struct Args {
     config: PathBuf,
 }
 
-#[derive(Debug)]
-enum TransformDecision {
-    /// Forward (optionally modified) bytes to the other party
-    Forward(Vec<u8>),
-    /// Do not send any data to the other party
-    Drop,
-    /// Do not send to the other party; send these bytes back to the origin instead
-    Respond(Vec<u8>),
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct Config {
     mappings: HashMap<String, String>,
+    intercept_writes: Option<bool>,
+    #[serde(default)]
+    diff_ttl: u64,
+}
+
+struct AppState {
+    config: Config,
+    diff_map: Arc<RwLock<TtlCache<AerospikeKey, Vec<AerospikeOperation>>>>,
 }
 
 fn load_config(path: &PathBuf) -> Result<Config> {
@@ -42,114 +43,9 @@ fn load_config(path: &PathBuf) -> Result<Config> {
     Ok(cfg)
 }
 
-fn transform_client_to_server(mut bytes: Vec<u8>) -> TransformDecision {
-    // Modify or inspect bytes from client to server here
-    debug!("Client to server:");
-    utils::packet_printer::print_packet(&bytes);
-
-    let packet = AerospikePacket::parse(bytes.as_slice());
-    match packet {
-        Ok(packet) => {
-
-            verify_supported_feature(&packet);
 
 
-            if let AerospikePacketBody::Info(_) = &packet.body {
-                // Do nothing
-            } else {
-                debug!("{:?}", packet);
-                match packet.body {
-                    AerospikePacketBody::Message(m) => {
-                        info!("{:?}", m.is_read());
-
-                        m.fields.iter().for_each(|f| {
-                            info!("{}", String::from_utf8_lossy(&f.data))
-                        });
-                        m.operations.iter().for_each(|op| {
-                            info!("{}", String::from_utf8_lossy(&op.data))
-                        });
-                    },
-                    _ => {}
-                }
-            }
-        },
-        Err(e) => {
-            match e {
-                ParseError::ErrorWhileParsingField(e) => { error!("{:?}", e) }
-                ParseError::ErrorWhileParsingMessage(e) => { error!("{:?}", e) }
-                _ => { error!("{:?}", e) }
-            }
-
-            // Drop packet
-            return TransformDecision::Drop;
-        }
-    }
-    // Example: by default, forward as-is
-    TransformDecision::Forward(bytes)
-}
-
-fn transform_server_to_client(mut bytes: Vec<u8>) -> TransformDecision {
-    // Modify or inspect bytes from server to client here
-    debug!("Server to client:");
-    utils::packet_printer::print_packet(&bytes);
-
-    let packet = AerospikePacket::parse(bytes.as_slice());
-    match packet {
-        Ok(packet) => {
-
-            verify_supported_feature(&packet);
-
-            if let AerospikePacketBody::Info(_) = &packet.body {
-                // Do nothing
-            } else {
-                debug!("{:?}", packet);
-                match packet.body {
-                    AerospikePacketBody::Message(m) => {
-                        info!("{:?}", m.is_read());
-
-                        m.fields.iter().for_each(|f| {
-                            info!("{}", String::from_utf8_lossy(&f.data))
-                        });
-                        m.operations.iter().for_each(|op| {
-                            info!("{}", String::from_utf8_lossy(&op.data))
-                        });
-                    }
-                    _ => {}
-                }
-            }
-        },
-        Err(e)=> {
-            match e {
-                ParseError::ErrorWhileParsingField(e) => {error!("{:?}", e)}
-                ParseError::ErrorWhileParsingMessage(e) => {error!("{:?}", e)}
-                _ => {error!("{:?}", e)}
-            }
-
-            return TransformDecision::Drop;
-
-        }
-    }
-    // Example: by default, forward as-is
-    TransformDecision::Forward(bytes)
-}
-
-fn verify_supported_feature(packet: &AerospikePacket) {
-    match &packet.body {
-        AerospikePacketBody::Info(_) => {}
-        AerospikePacketBody::Message(m) => {
-
-            if (m.info1 & (!INFO1_ALLOWED_MASK) != 0) ||
-                (m.info2 & (!INFO2_ALLOWED_MASK) != 0) ||
-                (m.info3 & (!INFO3_ALLOWED_MASK) != 0) ||
-                (m.info4 & (!INFO4_ALLOWED_MASK) != 0) {
-                panic!("Unsupported action, shutting down {:?}", packet);
-            }
-
-        }
-    }
-}
-
-async fn proxy_with_transform(mut inbound: TcpStream, mut outbound: TcpStream) -> io::Result<()> {
+async fn proxy_with_transform(mut inbound: TcpStream, mut outbound: TcpStream, state: Arc<AppState>) -> io::Result<()> {
     let (mut ri, wi) = inbound.split();
     let (mut ro, wo) = outbound.split();
 
@@ -158,6 +54,9 @@ async fn proxy_with_transform(mut inbound: TcpStream, mut outbound: TcpStream) -
 
     let wi_for_c2s = wi.clone();
     let wo_for_c2s = wo.clone();
+
+    let state_clone = state.clone();
+
     let client_to_server = async {
         let mut buf = vec![0u8; 16 * 1024];
         loop {
@@ -166,7 +65,7 @@ async fn proxy_with_transform(mut inbound: TcpStream, mut outbound: TcpStream) -
                 break;
             }
             let chunk = buf[..n].to_vec();
-            match transform_client_to_server(chunk) {
+            match transform_client_to_server(chunk, &*state_clone) {
                 TransformDecision::Forward(bytes) => {
                     let mut w = wo_for_c2s.lock().await;
                     w.write_all(&bytes).await?;
@@ -187,6 +86,8 @@ async fn proxy_with_transform(mut inbound: TcpStream, mut outbound: TcpStream) -
 
     let wi_for_s2c = wi.clone();
     let wo_for_s2c = wo.clone();
+
+
     let server_to_client = async {
         let mut buf = vec![0u8; 16 * 1024];
         loop {
@@ -195,7 +96,7 @@ async fn proxy_with_transform(mut inbound: TcpStream, mut outbound: TcpStream) -
                 break;
             }
             let chunk = buf[..n].to_vec();
-            match transform_server_to_client(chunk) {
+            match transform_server_to_client(chunk, &*state) {
                 TransformDecision::Forward(bytes) => {
                     let mut w = wi_for_s2c.lock().await;
                     w.write_all(&bytes).await?;
@@ -218,7 +119,7 @@ async fn proxy_with_transform(mut inbound: TcpStream, mut outbound: TcpStream) -
     Ok(())
 }
 
-async fn run_listener(listen_port: u16, target: String) -> Result<()> {
+async fn run_listener(listen_port: u16, target: String, state: Arc<AppState>) -> Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", listen_port))
         .await
         .with_context(|| format!("failed to bind on 0.0.0.0:{}", listen_port))?;
@@ -234,9 +135,10 @@ async fn run_listener(listen_port: u16, target: String) -> Result<()> {
         };
 
         let target_clone = target.clone();
+        let state_clone = state.clone();
         tokio::spawn(async move {
             match TcpStream::connect(target_clone.as_str()).await {
-                Ok(outbound) => match proxy_with_transform(inbound, outbound).await {
+                Ok(outbound) => match proxy_with_transform(inbound, outbound, state_clone).await {
                     Ok(()) => {
                         // info!(client = %peer_addr, "connection closed");
                     }
@@ -268,11 +170,19 @@ async fn main() -> Result<()> {
         warn!("no mappings configured");
     }
 
+    let diff_map: Arc<RwLock<TtlCache<AerospikeKey, Vec<AerospikeOperation>>>> = Arc::new(RwLock::new(TtlCache::new(20)));
+
+    let state = Arc::new(AppState {
+       config: config.clone(), diff_map
+    });
+
+
     for (listen_port, target) in &config.mappings {
         let listen_port = listen_port.clone();
         let target = target.clone();
+        let state_clone = state.clone();
         tokio::spawn(async move {
-            if let Err(err) = run_listener(listen_port.parse().unwrap(), target).await {
+            if let Err(err) = run_listener(listen_port.parse().unwrap(), target, state_clone).await {
                 error!(port = listen_port, %err, "listener terminated");
             }
         });
