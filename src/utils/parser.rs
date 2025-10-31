@@ -7,12 +7,12 @@ use tracing::warn;
 
 
 // READ, GET_ALL
-const INFO1_ALLOWED_MASK: u8 = (1 << 0) | (1 << 1);
+pub const INFO1_ALLOWED_MASK: u8 = (1 << 0) | (1 << 1);
 
 // WRITE, DELETE, CREATE_ONLY
-const INFO2_ALLOWED_MASK: u8 = (1 << 0) | (1 << 1) | (1 << 5);
-const INFO3_ALLOWED_MASK: u8 = 0;
-const INFO4_ALLOWED_MASK: u8 = 0;
+pub const INFO2_ALLOWED_MASK: u8 = (1 << 0) | (1 << 1) | (1 << 5);
+pub const INFO3_ALLOWED_MASK: u8 = 0;
+pub const INFO4_ALLOWED_MASK: u8 = 0;
 
 #[derive(Debug)]
 pub struct AerospikePacket {
@@ -48,10 +48,10 @@ impl AerospikePacket {
 #[derive(Debug)]
 pub struct AerospikeMessage {
     header_sz: u8,
-    info1: u8,
-    info2: u8,
-    info3: u8,
-    info4: u8,
+    pub info1: u8,
+    pub info2: u8,
+    pub info3: u8,
+    pub info4: u8,
     result_code: u8,
     generation: u32,
     record_ttl: u32,

@@ -2,7 +2,7 @@ mod utils;
 
 use std::{collections::HashMap, fs, path::PathBuf, sync::Arc};
 
-use crate::utils::parser::{AerospikePacket, AerospikePacketBody, ParseError};
+use crate::utils::parser::{AerospikePacket, AerospikePacketBody, ParseError, INFO1_ALLOWED_MASK, INFO2_ALLOWED_MASK, INFO3_ALLOWED_MASK, INFO4_ALLOWED_MASK};
 use anyhow::{Context, Result};
 use clap::Parser;
 use serde::Deserialize;
@@ -50,6 +50,10 @@ fn transform_client_to_server(mut bytes: Vec<u8>) -> TransformDecision {
     let packet = AerospikePacket::parse(bytes.as_slice());
     match packet {
         Ok(packet) => {
+
+            verify_supported_feature(&packet);
+
+
             if let AerospikePacketBody::Info(_) = &packet.body {
                 // Do nothing
             } else {
@@ -69,13 +73,15 @@ fn transform_client_to_server(mut bytes: Vec<u8>) -> TransformDecision {
                 }
             }
         },
-        Err(e)=> {
+        Err(e) => {
             match e {
-                ParseError::ErrorWhileParsingField(e) => {error!("{:?}", e)}
-                ParseError::ErrorWhileParsingMessage(e) => {error!("{:?}", e)}
-                _ => {error!("{:?}", e)}
+                ParseError::ErrorWhileParsingField(e) => { error!("{:?}", e) }
+                ParseError::ErrorWhileParsingMessage(e) => { error!("{:?}", e) }
+                _ => { error!("{:?}", e) }
             }
 
+            // Drop packet
+            return TransformDecision::Drop;
         }
     }
     // Example: by default, forward as-is
@@ -90,6 +96,9 @@ fn transform_server_to_client(mut bytes: Vec<u8>) -> TransformDecision {
     let packet = AerospikePacket::parse(bytes.as_slice());
     match packet {
         Ok(packet) => {
+
+            verify_supported_feature(&packet);
+
             if let AerospikePacketBody::Info(_) = &packet.body {
                 // Do nothing
             } else {
@@ -116,10 +125,28 @@ fn transform_server_to_client(mut bytes: Vec<u8>) -> TransformDecision {
                 _ => {error!("{:?}", e)}
             }
 
+            return TransformDecision::Drop;
+
         }
     }
     // Example: by default, forward as-is
     TransformDecision::Forward(bytes)
+}
+
+fn verify_supported_feature(packet: &AerospikePacket) {
+    match &packet.body {
+        AerospikePacketBody::Info(_) => {}
+        AerospikePacketBody::Message(m) => {
+
+            if (m.info1 & (!INFO1_ALLOWED_MASK) != 0) ||
+                (m.info2 & (!INFO2_ALLOWED_MASK) != 0) ||
+                (m.info3 & (!INFO3_ALLOWED_MASK) != 0) ||
+                (m.info4 & (!INFO4_ALLOWED_MASK) != 0) {
+                panic!("Unsupported action, shutting down {:?}", packet);
+            }
+
+        }
+    }
 }
 
 async fn proxy_with_transform(mut inbound: TcpStream, mut outbound: TcpStream) -> io::Result<()> {
