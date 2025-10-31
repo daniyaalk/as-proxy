@@ -1,11 +1,11 @@
 use byteorder::{BigEndian, ReadBytesExt};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io;
 use std::io::{Cursor, Read};
 use std::string::FromUtf8Error;
 use toml::macros::push_toml;
 use tracing::warn;
-
 
 // READ, GET_ALL
 pub const INFO1_ALLOWED_MASK: u8 = (1 << 0) | (1 << 1);
@@ -46,15 +46,14 @@ impl AerospikePacket {
     }
 
     pub fn new(body: AerospikePacketBody) -> AerospikePacket {
-
         let message_type;
         let size;
         match &body {
             AerospikePacketBody::Message(m) => {
                 message_type = 0x03;
                 size = m.get_raw_byte_size();
-            },
-            _ => unimplemented!()
+            }
+            _ => unimplemented!(),
         };
         AerospikePacket {
             version: 0x02,
@@ -70,7 +69,7 @@ impl AerospikePacket {
         ret.push(self.version);
         ret.push(self.message_type);
         ret.extend(&(self.size).to_be_bytes()[2..]);
-            ret.extend(self.body.to_bytes());
+        ret.extend(self.body.to_bytes());
         ret
     }
 }
@@ -104,22 +103,26 @@ impl AerospikeMessage {
 
         let mut cursor = Cursor::new(data);
 
-        let header_sz=cursor.read_u8()?;
-        let info1=cursor.read_u8()?;
-        let info2=cursor.read_u8()?;
-        let info3=cursor.read_u8()?;
-        let info4=cursor.read_u8()?;
-        let result_code=cursor.read_u8()?;
-        let generation=cursor.read_u32::<BigEndian>()?;
-        let record_ttl=cursor.read_u32::<BigEndian>()?;
-        let transaction_ttl=cursor.read_u32::<BigEndian>()?;
+        let header_sz = cursor.read_u8()?;
+        let info1 = cursor.read_u8()?;
+        let info2 = cursor.read_u8()?;
+        let info3 = cursor.read_u8()?;
+        let info4 = cursor.read_u8()?;
+        let result_code = cursor.read_u8()?;
+        let generation = cursor.read_u32::<BigEndian>()?;
+        let record_ttl = cursor.read_u32::<BigEndian>()?;
+        let transaction_ttl = cursor.read_u32::<BigEndian>()?;
         let n_fields = cursor.read_u16::<BigEndian>()?;
         let n_ops = cursor.read_u16::<BigEndian>()?;
-        let fields=AerospikeField::parse(n_fields as usize, &mut cursor)?;
-        let operations=AerospikeOperation::parse(n_ops as usize, &mut cursor)?;
+        let fields = AerospikeField::parse(n_fields as usize, &mut cursor)?;
+        let operations = AerospikeOperation::parse(n_ops as usize, &mut cursor)?;
 
         if cursor.position() as usize != data.len() {
-            panic!("Cursor at {} while data length is {}", cursor.position(), data.len());
+            panic!(
+                "Cursor at {} while data length is {}",
+                cursor.position(),
+                data.len()
+            );
         }
 
         Ok(AerospikeMessage {
@@ -135,7 +138,7 @@ impl AerospikeMessage {
             n_fields,
             n_ops,
             fields,
-            operations
+            operations,
         })
     }
 
@@ -174,11 +177,21 @@ impl AerospikeMessage {
             ret.extend(operation.to_bytes());
         }
 
-
         ret
     }
 
-    pub fn new(info1: u8, info2: u8, info3: u8, info4: u8, result_code: u8, generation: u32, record_ttl: u32, transaction_ttl: u32, fields: Vec<AerospikeField>, operations: Vec<AerospikeOperation>) -> Self {
+    pub fn new(
+        info1: u8,
+        info2: u8,
+        info3: u8,
+        info4: u8,
+        result_code: u8,
+        generation: u32,
+        record_ttl: u32,
+        transaction_ttl: u32,
+        fields: Vec<AerospikeField>,
+        operations: Vec<AerospikeOperation>,
+    ) -> Self {
         AerospikeMessage {
             header_sz: 0x16,
             info1,
@@ -196,7 +209,6 @@ impl AerospikeMessage {
         }
     }
     pub fn get_successful_write_packet(record_ttl: u32, transaction_ttl: u32) -> Vec<u8> {
-
         let mut ret = Vec::with_capacity(22);
         ret.push(0x02); // version
 
@@ -222,8 +234,10 @@ impl AerospikeMessage {
         }
 
         record_ttl.to_be_bytes().iter().for_each(|&x| ret.push(x));
-        transaction_ttl.to_be_bytes().iter().for_each(|&x| ret.push(x));
-
+        transaction_ttl
+            .to_be_bytes()
+            .iter()
+            .for_each(|&x| ret.push(x));
 
         // n_fields
         ret.push(0x00);
@@ -237,28 +251,27 @@ impl AerospikeMessage {
     }
 
     pub fn is_read_op(&self) -> bool {
-        self.info1 & (1<<0) != 0
+        self.info1 & (1 << 0) != 0
     }
 
     pub fn get_all_bins(&self) -> bool {
-        self.info1 & (1<<1) != 0
+        self.info1 & (1 << 1) != 0
     }
 
     pub fn is_batch_query(&self) -> bool {
-        self.info1 & (1<<3) != 0
-
+        self.info1 & (1 << 3) != 0
     }
 
     pub fn is_write_op(&self) -> bool {
-        self.info2 & (1<<0) != 0
+        self.info2 & (1 << 0) != 0
     }
 
     pub fn is_delete(&self) -> bool {
-        self.info2 & (1<<0) != 0
+        self.info2 & (1 << 0) != 0
     }
 
     pub fn is_create_ony(&self) -> bool {
-        self.info2 & (1<<5) != 0
+        self.info2 & (1 << 5) != 0
     }
 }
 
@@ -285,20 +298,23 @@ pub enum AerospikePacketBody {
 }
 
 impl AerospikePacketBody {
-    pub fn from_bytes(msg_type: u8, len: usize, data: &[u8]) -> Result<AerospikePacketBody, ParseError> {
+    pub fn from_bytes(
+        msg_type: u8,
+        len: usize,
+        data: &[u8],
+    ) -> Result<AerospikePacketBody, ParseError> {
         match msg_type {
             0x01 => Self::parse_info_packet(data),
-            0x03 => Ok(AerospikePacketBody::Message(AerospikeMessage::from_bytes(data)?)),
+            0x03 => Ok(AerospikePacketBody::Message(AerospikeMessage::from_bytes(
+                data,
+            )?)),
             _ => Err(ParseError::UnsupportedMessageType),
         }
     }
 
     pub fn to_bytes(self) -> Vec<u8> {
-
         match self {
-            AerospikePacketBody::Message(m) => {
-                m.to_bytes()
-            },
+            AerospikePacketBody::Message(m) => m.to_bytes(),
             AerospikePacketBody::Info(_) => todo!(),
         }
     }
@@ -333,36 +349,35 @@ impl AerospikePacketBody {
 
 pub type AerospikeInfo = HashMap<String, Option<String>>;
 
-#[derive(Debug)]
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum AerospikeFieldType {
-    Namespace=0,
-    Set=1,
-    Key=2,
-    RecordVersion =3,
-    DigestRipe =4,
-    MrtId =5,
-    MrtDeadline =6,
-    TRID=7,
-    SocketTimeout =9,
-    RecsPerSec =10,
-    PidArray =11,
-    DigestArray =12,
-    SampleMax =13,
-    LUT=14,
-    BvalArray =15,
-    IndexName =21,
-    IndexRange =22,
-    IndexContext =23,
-    IndexType =26,
-    UdfFilename =30,
-    UdfFunction =31,
-    UdfArglist =32,
-    UdfOp =33,
-    QueryBinlist =40,
-    Batch=41,
-    BatchWithSet =42,
-    PredExp=43,
+    Namespace = 0,
+    Set = 1,
+    Key = 2,
+    RecordVersion = 3,
+    DigestRipe = 4,
+    MrtId = 5,
+    MrtDeadline = 6,
+    TRID = 7,
+    SocketTimeout = 9,
+    RecsPerSec = 10,
+    PidArray = 11,
+    DigestArray = 12,
+    SampleMax = 13,
+    LUT = 14,
+    BvalArray = 15,
+    IndexName = 21,
+    IndexRange = 22,
+    IndexContext = 23,
+    IndexType = 26,
+    UdfFilename = 30,
+    UdfFunction = 31,
+    UdfArglist = 32,
+    UdfOp = 33,
+    QueryBinlist = 40,
+    Batch = 41,
+    BatchWithSet = 42,
+    PredExp = 43,
 }
 impl TryFrom<u8> for AerospikeFieldType {
     type Error = ();
@@ -402,7 +417,7 @@ impl TryFrom<u8> for AerospikeFieldType {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AerospikeField {
     size: u32,
     pub field_type: AerospikeFieldType,
@@ -416,7 +431,6 @@ impl AerospikeField {
 }
 
 impl AerospikeField {
-
     fn parse(count: usize, cursor: &mut Cursor<&[u8]>) -> Result<Vec<AerospikeField>, ParseError> {
         let mut fields: Vec<AerospikeField> = Vec::with_capacity(count);
 
@@ -428,7 +442,7 @@ impl AerospikeField {
     }
 
     fn parse_one(cursor: &mut Cursor<&[u8]>) -> Result<AerospikeField, ParseError> {
-        let size= cursor.read_u32::<BigEndian>()?;
+        let size = cursor.read_u32::<BigEndian>()?;
         let field_type = AerospikeFieldType::try_from(cursor.read_u8()?);
 
         if let Err(_) = field_type {
@@ -441,7 +455,7 @@ impl AerospikeField {
             cursor.read_exact(&mut buf)?;
             buf
         };
-        Ok(AerospikeField{
+        Ok(AerospikeField {
             size,
             field_type,
             data,
@@ -453,7 +467,7 @@ impl AerospikeField {
     }
 }
 
-#[derive(Debug,Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AerospikeOperation {
     op_sz: u32,
     pub op: u8,
@@ -464,9 +478,11 @@ pub struct AerospikeOperation {
     pub data: Vec<u8>,
 }
 
-
 impl AerospikeOperation {
-    fn parse(count: usize, cursor: &mut Cursor<&[u8]>) -> Result<Vec<AerospikeOperation>, ParseError> {
+    fn parse(
+        count: usize,
+        cursor: &mut Cursor<&[u8]>,
+    ) -> Result<Vec<AerospikeOperation>, ParseError> {
         let mut fields: Vec<AerospikeOperation> = Vec::with_capacity(count);
 
         while fields.len() < count {
@@ -497,7 +513,7 @@ impl AerospikeOperation {
             bin_version,
             bin_name_length: bin_name.len() as u8,
             bin_name: bin_name.into(),
-            data
+            data,
         }
     }
     fn get_raw_byte_size(&self) -> usize {
@@ -505,16 +521,17 @@ impl AerospikeOperation {
     }
 
     fn parse_one(cursor: &mut Cursor<&[u8]>) -> Result<AerospikeOperation, ParseError> {
-        let op_sz= cursor.read_u32::<BigEndian>()?;
+        let op_sz = cursor.read_u32::<BigEndian>()?;
         let op = cursor.read_u8()?;
-        let particle_type= cursor.read_u8()?;
+        let particle_type = cursor.read_u8()?;
         let bin_version = cursor.read_u8()?;
         let bin_name_length = cursor.read_u8()?;
         let bin_name = String::from_utf8({
             let mut buf = vec![0u8; bin_name_length as usize]; // 1 byte is used by the field_type
             cursor.read_exact(&mut buf)?;
             buf
-        }).map_err(|e| ParseError::ErrorWhileParsingMessage(e))?;
+        })
+        .map_err(|e| ParseError::ErrorWhileParsingMessage(e))?;
 
         let data = {
             let mut buf = vec![0u8; (op_sz - 4 - (bin_name_length as u32)) as usize];
@@ -522,7 +539,7 @@ impl AerospikeOperation {
             buf
         };
         let data_as_str = String::from_utf8_lossy(&data);
-        Ok(AerospikeOperation{
+        Ok(AerospikeOperation {
             op_sz,
             op,
             particle_type,
@@ -534,26 +551,36 @@ impl AerospikeOperation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AerospikeKey {
     pub namespace: String,
     pub set: String,
-    pub digest: Vec<u8>
+    pub digest: Vec<u8>,
 }
 
-
 impl AerospikeKey {
-    pub fn parse(fields: Vec<AerospikeField>) -> Option<Self> {
-        if fields.len() != 3 { return None;}
+    pub fn parse(fields: &Vec<AerospikeField>) -> Option<Self> {
+        if fields.len() != 3 {
+            return None;
+        }
 
-        let namespace = fields.iter().filter(|x| x.field_type == AerospikeFieldType::Namespace).last()?;
-        let set = fields.iter().filter(|x| x.field_type == AerospikeFieldType::Set).last()?;
-        let digest = fields.iter().filter(|x| x.field_type == AerospikeFieldType::Namespace).last()?;
+        let namespace = fields
+            .iter()
+            .filter(|x| x.field_type == AerospikeFieldType::Namespace)
+            .last()?;
+        let set = fields
+            .iter()
+            .filter(|x| x.field_type == AerospikeFieldType::Set)
+            .last()?;
+        let digest = fields
+            .iter()
+            .filter(|x| x.field_type == AerospikeFieldType::Namespace)
+            .last()?;
 
         Some(AerospikeKey {
             namespace: String::from_utf8(namespace.data.clone()).ok()?,
             set: String::from_utf8(set.data.clone()).ok()?,
-            digest: digest.data.to_vec()
+            digest: digest.data.to_vec(),
         })
     }
 }

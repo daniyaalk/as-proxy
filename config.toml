@@ -1,9 +1,14 @@
-intercept_writes = true
+#intercept_writes = true
 diff_ttl=120
 
 [mappings]
 "4000" = "127.0.0.1:3000"
 "4001" = "tpap-cache-2:3000"
 "4002" = "tpap-cache-3:3000"
+
+[kafka_config]
+hosts = "localhost:9092"
+topic = "test"
+mode = "Produce"
 
 

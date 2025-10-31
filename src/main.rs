@@ -1,12 +1,18 @@
-mod utils;
 mod handler;
+mod utils;
 
-use std::{collections::HashMap, fs, path::PathBuf, sync::Arc};
-use std::sync::{Mutex, RwLock};
-use crate::utils::parser::{AerospikeKey, AerospikeOperation, AerospikePacket, AerospikePacketBody, ParseError, INFO1_ALLOWED_MASK, INFO2_ALLOWED_MASK, INFO3_ALLOWED_MASK, INFO4_ALLOWED_MASK};
+use crate::handler::{TransformDecision, transform_client_to_server, transform_server_to_client};
+use crate::utils::parser::{
+    AerospikeKey, AerospikeOperation, AerospikePacket, AerospikePacketBody, INFO1_ALLOWED_MASK,
+    INFO2_ALLOWED_MASK, INFO3_ALLOWED_MASK, INFO4_ALLOWED_MASK, ParseError,
+};
 use anyhow::{Context, Result};
 use clap::Parser;
+use kafka::producer::{Producer, RequiredAcks};
 use serde::Deserialize;
+use std::sync::{Mutex, RwLock};
+use std::time::Duration;
+use std::{collections::HashMap, fs, path::PathBuf, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::{
     io,
@@ -14,7 +20,6 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 use ttl_cache::TtlCache;
-use crate::handler::{transform_client_to_server, transform_server_to_client, TransformDecision};
 
 #[derive(Parser, Debug)]
 #[command(name = "as-proxy", version, about = "Simple multi-port TCP proxy")]
@@ -29,11 +34,31 @@ struct Config {
     intercept_writes: Option<bool>,
     #[serde(default)]
     diff_ttl: u64,
+
+    #[cfg(feature = "replay")]
+    kafka_config: Option<KafkaConfig>,
+}
+
+#[cfg(feature = "replay")]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+enum KafkaMode {
+    Produce,
+    Consume,
+}
+
+#[cfg(feature = "replay")]
+#[derive(Debug, Deserialize, Clone)]
+struct KafkaConfig {
+    hosts: String,
+    topic: String,
+    mode: KafkaMode,
 }
 
 struct AppState {
     config: Config,
     diff_map: Arc<RwLock<TtlCache<AerospikeKey, Vec<AerospikeOperation>>>>,
+    #[cfg(feature = "replay")]
+    kafka_producer: Option<Arc<Mutex<Producer>>>,
 }
 
 fn load_config(path: &PathBuf) -> Result<Config> {
@@ -43,9 +68,11 @@ fn load_config(path: &PathBuf) -> Result<Config> {
     Ok(cfg)
 }
 
-
-
-async fn proxy_with_transform(mut inbound: TcpStream, mut outbound: TcpStream, state: Arc<AppState>) -> io::Result<()> {
+async fn proxy_with_transform(
+    mut inbound: TcpStream,
+    mut outbound: TcpStream,
+    state: Arc<AppState>,
+) -> io::Result<()> {
     let (mut ri, wi) = inbound.split();
     let (mut ro, wo) = outbound.split();
 
@@ -57,6 +84,9 @@ async fn proxy_with_transform(mut inbound: TcpStream, mut outbound: TcpStream, s
 
     let state_clone = state.clone();
 
+    #[cfg(feature = "replay")]
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AerospikeKey>();
+
     let client_to_server = async {
         let mut buf = vec![0u8; 16 * 1024];
         loop {
@@ -65,7 +95,14 @@ async fn proxy_with_transform(mut inbound: TcpStream, mut outbound: TcpStream, s
                 break;
             }
             let chunk = buf[..n].to_vec();
-            match transform_client_to_server(chunk, &*state_clone) {
+            match transform_client_to_server(
+                chunk,
+                &*state_clone,
+                #[cfg(feature = "replay")]
+                &tx,
+            )
+            .await
+            {
                 TransformDecision::Forward(bytes) => {
                     let mut w = wo_for_c2s.lock().await;
                     w.write_all(&bytes).await?;
@@ -87,7 +124,6 @@ async fn proxy_with_transform(mut inbound: TcpStream, mut outbound: TcpStream, s
     let wi_for_s2c = wi.clone();
     let wo_for_s2c = wo.clone();
 
-
     let server_to_client = async {
         let mut buf = vec![0u8; 16 * 1024];
         loop {
@@ -96,7 +132,7 @@ async fn proxy_with_transform(mut inbound: TcpStream, mut outbound: TcpStream, s
                 break;
             }
             let chunk = buf[..n].to_vec();
-            match transform_server_to_client(chunk, &*state) {
+            match transform_server_to_client(chunk, &*state, &mut rx).await {
                 TransformDecision::Forward(bytes) => {
                     let mut w = wi_for_s2c.lock().await;
                     w.write_all(&bytes).await?;
@@ -170,19 +206,23 @@ async fn main() -> Result<()> {
         warn!("no mappings configured");
     }
 
-    let diff_map: Arc<RwLock<TtlCache<AerospikeKey, Vec<AerospikeOperation>>>> = Arc::new(RwLock::new(TtlCache::new(20)));
+    let diff_map: Arc<RwLock<TtlCache<AerospikeKey, Vec<AerospikeOperation>>>> =
+        Arc::new(RwLock::new(TtlCache::new(20)));
 
     let state = Arc::new(AppState {
-       config: config.clone(), diff_map
+        config: config.clone(),
+        diff_map,
+        #[cfg(feature = "replay")]
+        kafka_producer: get_kafka_producer(&config),
     });
-
 
     for (listen_port, target) in &config.mappings {
         let listen_port = listen_port.clone();
         let target = target.clone();
         let state_clone = state.clone();
         tokio::spawn(async move {
-            if let Err(err) = run_listener(listen_port.parse().unwrap(), target, state_clone).await {
+            if let Err(err) = run_listener(listen_port.parse().unwrap(), target, state_clone).await
+            {
                 error!(port = listen_port, %err, "listener terminated");
             }
         });
@@ -194,4 +234,19 @@ async fn main() -> Result<()> {
         .context("failed to install Ctrl+C handler")?;
     info!("shutting down");
     Ok(())
+}
+
+#[cfg(feature = "replay")]
+fn get_kafka_producer(config: &Config) -> Option<Arc<Mutex<Producer>>> {
+    if let Some(kc) = &config.kafka_config {
+        Some(Arc::new(Mutex::new(
+            Producer::from_hosts(kc.hosts.split(',').map(|s| s.to_string()).collect())
+                .with_ack_timeout(Duration::from_secs(1))
+                .with_required_acks(RequiredAcks::None)
+                .create()
+                .unwrap(),
+        )))
+    } else {
+        None
+    }
 }
