@@ -94,6 +94,7 @@ mode  = "Consume" # or "Produce"
   - hosts (string): comma-separated Kafka brokers (e.g., `"localhost:9092,localhost:9093"`)
   - topic (string): topic to produce/consume replay records
   - mode (enum): `Produce` or `Consume`
+  - prioritize_local_cache (boolean): In consume mode, don't override query responses if the same key has been inserted and stored to cache with `intercept_writes = true`.
 
 ---
 

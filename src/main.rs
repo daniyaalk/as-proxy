@@ -54,6 +54,7 @@ struct KafkaConfig {
     hosts: String,
     topic: String,
     mode: KafkaMode,
+    prioritize_local_cache: Option<bool>,
 }
 
 struct AppState {
@@ -77,7 +78,6 @@ impl AppState {
     }
 
     pub fn intercept_messages(&self) -> bool {
-
         #[cfg(feature = "replay")]
         {
             self.is_write_intercept_enabled() || self.is_kafka_consumer_enabled()
@@ -87,10 +87,7 @@ impl AppState {
         {
             self.is_write_intercept_enabled()
         }
-
-
     }
-
 }
 
 fn load_config(path: &PathBuf) -> Result<Config> {
@@ -299,6 +296,8 @@ fn spawn_kafka_receiver(
     .with_fetch_max_bytes_per_partition(16 * 1024 * 1024)
     .create()?;
 
+    let prioritize_local_cache = kafka_config.prioritize_local_cache.clone();
+
     let _ = tokio::spawn(async move {
         loop {
             match consumer.poll() {
@@ -310,6 +309,14 @@ fn spawn_kafka_receiver(
                             match serde_json::from_str::<ReplayRecord>(&message_string) {
                                 Ok(record) => {
                                     let mut cache = cache.write().unwrap();
+
+                                    if prioritize_local_cache.is_some_and(|x| x) {
+                                        // If prioritize_local_cache is enabled and the key for current record already exists, don't override with replay response.
+                                        if cache.contains_key(&record.key) {
+                                            continue;
+                                        }
+                                    }
+
                                     cache.insert(
                                         record.key,
                                         record.operations,

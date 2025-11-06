@@ -39,10 +39,10 @@ pub async fn transform_client_to_server(
     };
 
     if let AerospikePacketBody::Message(message) = packet.body {
-        if state.intercept_messages() ||
-            (cfg!(feature = "replay") && state.is_kafka_consumer_enabled()) {
-
-                if message.is_write_op() {
+        if state.intercept_messages()
+            || (cfg!(feature = "replay") && state.is_kafka_consumer_enabled())
+        {
+            if message.is_write_op() {
                 let key = AerospikeKey::parse(&message.fields);
 
                 if key.is_some() {
